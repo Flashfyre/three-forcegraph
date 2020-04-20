@@ -129,6 +129,7 @@ export default Kapsule({
     nodeAutoColorBy: {},
     nodeOpacity: { default: 0.75 },
     nodeVisibility: { default: true },
+    nodesPerStack: { default: 20, triggerUpdate: false },
     nodeThreeObject: {},
     nodeThreeObjectExtend: { default: false },
     linkSource: { default: 'source' },
@@ -154,6 +155,7 @@ export default Kapsule({
     linkDirectionalParticleWidth: { default: 0.5 },
     linkDirectionalParticleColor: {},
     linkDirectionalParticleResolution: { default: 4 }, // how many slice segments in the particle sphere's circumference
+    connMode: { default: 0, triggerUpdate: false },
     forceEngine: { default: 'd3' }, // d3 or ngraph
     d3AlphaMin: { default: 0, triggerUpdate: false },
     d3AlphaDecay: { default: 0.0228, triggerUpdate: false, onChange(alphaDecay, state) { state.d3ForceLayout.alphaDecay(alphaDecay) }},
@@ -195,6 +197,9 @@ export default Kapsule({
       state.startTickTime = new Date();
       state.engineRunning = true;
       return this;
+    },
+    getDagDepths: function(state) {
+      return getDagDepths(state.graphData, node => node[state.nodeId]);
     },
     tickFrame: function(state) {
       const isD3Sim = state.forceEngine !== 'ngraph';
@@ -579,7 +584,7 @@ export default Kapsule({
       'nodeVisibility',
       'nodeRelSize',
       'nodeResolution',
-      'nodeOpacity'
+      'nodeOpacity',
     ])) {
       const customObjectAccessor = accessorFn(state.nodeThreeObject);
       const customObjectExtendAccessor = accessorFn(state.nodeThreeObjectExtend);
@@ -988,18 +993,62 @@ export default Kapsule({
         }
 
         // setup dag force constraints
-        const nodeDepths = state.dagMode && getDagDepths(state.graphData, node => node[state.nodeId]);
+        const getVal = accessorFn(state.nodeVal);
+        const nodesPerStack = state.nodesPerStack;
+
+        var nodeDepths = state.dagMode && getDagDepths(state.graphData, node => {
+          return node[state.nodeId];
+        });
+        let depthCounts;
+        let depthStackCounts;
+        let depthYOffsets;
+        if (nodeDepths) {
+          depthCounts = {};
+          depthStackCounts = {};
+          depthYOffsets = {};
+          Object.values(nodeDepths).forEach(d => {
+            if (!depthCounts[d])
+            depthCounts[d] = 0;
+            depthCounts[d]++;
+          });
+          Object.keys(depthCounts).forEach(d => {
+            const depthCount = depthCounts[d];
+            if (depthCount < nodesPerStack)
+            depthStackCounts[d] = 1;
+            else {
+            const count = Math.ceil(depthCount / nodesPerStack);
+            depthStackCounts[d] = count;
+            depthYOffsets[d] = (count - 1) / -2;
+            }
+          });
+        }
+
         const maxDepth = Math.max(...Object.values(nodeDepths || []));
-        const dagLevelDistance = state.dagLevelDistance || (
-          state.graphData.nodes.length / (maxDepth || 1) * DAG_LEVEL_NODE_RATIO
-          * (['radialin', 'radialout'].indexOf(state.dagMode) !== -1 ? 0.7 : 1)
-        );
+        const isDagRadial = state.dagMode && ['radialin', 'radialout'].indexOf(state.dagMode) !== -1;
+        const dagLevelDistance = state.dagLevelDistance || state.graphData.nodes.length / (maxDepth || 1) * DAG_LEVEL_NODE_RATIO * (isDagRadial ? 0.7 : 1); 
 
         // Fix nodes to x,y,z for dag mode
-        if (state.dagMode) {
-          const getFFn = (fix, invert) => node => !fix
-            ? undefined
-            : (nodeDepths[node[state.nodeId]] - maxDepth / 2) * dagLevelDistance * (invert ? -1 : 1);
+        if (state.dagMode && !isDagRadial) {
+          const depthDistances = {};
+          const depthMaxNodeVals = {};
+          let dagOffset;
+          const getFFn = (fix, invert) => {
+            return node => {
+                const nodeDepth = nodeDepths[node[state.nodeId]];
+                const depthStackCount = depthStackCounts[nodeDepth];
+                const yOffset = depthStackCount === 1 ? 0 : (depthYOffsets[nodeDepth] * depthMaxNodeVals[nodeDepth]);
+                if (fix && depthStackCount > 1)
+                depthYOffsets[nodeDepth] += depthYOffsets[nodeDepth] < (depthStackCounts[nodeDepth] / 2) - 1 ? 1 : (depthStackCount * -1) + 1;
+                return !fix ? undefined : (depthDistances[nodeDepth] + dagOffset) * (invert ? -1 : 1) + yOffset;
+            };
+          };
+
+          Object.keys(depthCounts).forEach(d => {
+            depthMaxNodeVals[d] = _.max(state.graphData.nodes.filter(node => nodeDepths[node[state.nodeId]] == d).map(node => getVal(node)));
+            depthDistances[d] = (d > 0 ? depthDistances[d - 1] : 0) + depthMaxNodeVals[d] * (depthStackCounts[d] + 0.5) + dagLevelDistance;
+          });
+
+          dagOffset = depthDistances[maxDepth] / -2;
 
           const fxFn = getFFn(['lr', 'rl'].indexOf(state.dagMode) !== -1, state.dagMode === 'rl');
           const fyFn = getFFn(['td', 'bu'].indexOf(state.dagMode) !== -1, state.dagMode === 'td');
@@ -1014,7 +1063,7 @@ export default Kapsule({
 
         // Use radial force for radial dags
         state.d3ForceLayout.force('dagRadial',
-          ['radialin', 'radialout'].indexOf(state.dagMode) !== -1
+          isDagRadial
             ? d3ForceRadial(node => {
                 const nodeDepth = nodeDepths[node[state.nodeId]];
                 return (state.dagMode === 'radialin' ? maxDepth - nodeDepth : nodeDepth) * dagLevelDistance;

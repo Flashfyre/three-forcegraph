@@ -35,7 +35,7 @@ export default function({ nodes, links }, idAccessor) {
       }
       if (currentDepth > node.depth) { // Don't unnecessarily revisit chunks of the graph
         node.depth = currentDepth;
-        traverse(node.out, [...nodeStack, node]);
+        traverse(node.out.filter(n => node.data.dagIgnore.indexOf(n.data.id) === -1), [...nodeStack, node]);
       }
     }
   }

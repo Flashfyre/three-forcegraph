@@ -1044,7 +1044,7 @@ export default Kapsule({
           };
 
           Object.keys(depthCounts).forEach(d => {
-            depthMaxNodeVals[d] = _.max(state.graphData.nodes.filter(node => nodeDepths[node[state.nodeId]] == d).map(node => getVal(node)));
+            depthMaxNodeVals[d] = Math.max(...state.graphData.nodes.filter(node => nodeDepths[node[state.nodeId]] == d).map(node => getVal(node)));
             depthDistances[d] = (d > 0 ? depthDistances[d - 1] : 0) + depthMaxNodeVals[d] * (depthStackCounts[d] + 0.5) + dagLevelDistance;
           });
 

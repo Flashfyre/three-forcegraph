@@ -30,11 +30,14 @@ export default function({ nodes, links }, idAccessor) {
     for (var i=0, l=nodes.length; i<l; i++) {
       const node = nodes[i];
       if (nodeStack.indexOf(node) !== -1) {
-        const loop = [...nodeStack.slice(nodeStack.indexOf(node)), node].map(d => idAccessor(d.data));
+        const loop = [...nodeStack.slice(nodeStack.indexOf(node)), node].map(d => {
+          const nodeId = idAccessor(d.data);
+          return d.data.img ? `${d.data.img.title} (${nodeId})` : nodeId;
+        });
         throw `Invalid DAG structure! Found cycle in node path: ${loop.join(' -> ')}.`;
       }
       if (currentDepth > node.depth) { // Don't unnecessarily revisit chunks of the graph
-        node.depth = currentDepth;
+        node.depth = node.data.depthOverride || currentDepth;
         traverse(node.out.filter(n => node.data.dagIgnore.indexOf(n.data.id) === -1), [...nodeStack, node]);
       }
     }

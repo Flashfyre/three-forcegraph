@@ -14,7 +14,8 @@ import {
   Line,
   LineBasicMaterial,
   QuadraticBezierCurve3,
-  CubicBezierCurve3
+  CubicBezierCurve3,
+  Box3
 } from 'three';
 
 const three = window.THREE
@@ -35,7 +36,8 @@ const three = window.THREE
     Line,
     LineBasicMaterial,
     QuadraticBezierCurve3,
-    CubicBezierCurve3
+    CubicBezierCurve3,
+    Box3
   };
 
 import {
@@ -48,11 +50,12 @@ import {
 
 import graph from 'ngraph.graph';
 import forcelayout from 'ngraph.forcelayout';
-import forcelayout3d from 'ngraph.forcelayout3d';
-const ngraph = { graph, forcelayout, forcelayout3d };
+const ngraph = { graph, forcelayout };
 
 import Kapsule from 'kapsule';
 import accessorFn from 'accessor-fn';
+
+import { min as d3Min, max as d3Max } from 'd3-array';
 
 import threeDigest from './utils/three-digest';
 import { emptyObject } from './utils/three-gc';
@@ -92,10 +95,6 @@ export default Kapsule({
         links: []
       },
       onChange(graphData, state) {
-        if (graphData.nodes.length || graphData.links.length) {
-          console.info('force-graph loading', graphData.nodes.length + ' nodes', graphData.links.length + ' links');
-        }
-
         state.engineRunning = false; // Pause simulation immediately
       }
     },
@@ -121,6 +120,8 @@ export default Kapsule({
       !dagMode && state.forceEngine === 'd3' && (state.graphData.nodes || []).forEach(n => n.fx = n.fy = n.fz = undefined); // unfix nodes when disabling dag mode
     }},
     dagLevelDistance: {},
+    dagNodeFilter: { default: node => true },
+    onDagError: { triggerUpdate: false },
     nodeRelSize: { default: 4 }, // volume per val unit
     nodeId: { default: 'id' },
     nodeVal: { default: 'val' },
@@ -161,6 +162,15 @@ export default Kapsule({
     d3AlphaDecay: { default: 0.0228, triggerUpdate: false, onChange(alphaDecay, state) { state.d3ForceLayout.alphaDecay(alphaDecay) }},
     d3AlphaTarget: { default: 0, triggerUpdate: false, onChange(alphaTarget, state) { state.d3ForceLayout.alphaTarget(alphaTarget) }},
     d3VelocityDecay: { default: 0.4, triggerUpdate: false, onChange(velocityDecay, state) { state.d3ForceLayout.velocityDecay(velocityDecay) } },
+    ngraphPhysics: { default: {
+      // defaults from https://github.com/anvaka/ngraph.physics.simulator/blob/master/index.js
+      timeStep: 20,
+      gravity: -1.2,
+      theta: 0.8,
+      springLength: 30,
+      springCoefficient: 0.0008,
+      dragCoefficient: 0.02
+    }},
     warmupTicks: { default: 0, triggerUpdate: false }, // how many times to tick the force engine at init before starting to render
     cooldownTicks: { default: Infinity, triggerUpdate: false },
     cooldownTime: { default: 15000, triggerUpdate: false }, // ms
@@ -296,7 +306,7 @@ export default Kapsule({
           } else if (line.type === 'Mesh') { // Update cylinder geometry
 
             if (!curve) { // straight tube
-              if (line.geometry.type !== 'CylinderBufferGeometry') {
+              if (!line.geometry.type.match(/^Cylinder(Buffer)?Geometry$/)) {
                 const linkWidth = Math.ceil(linkWidthAccessor(link) * 10) / 10;
                 const r = linkWidth / 2;
 
@@ -321,7 +331,7 @@ export default Kapsule({
               line.parent.localToWorld(vEnd); // lookAt requires world coords
               line.lookAt(vEnd);
             } else { // curved tube
-              if (line.geometry.type !== 'TubeBufferGeometry') {
+              if (!line.geometry.type.match(/^Tube(Buffer)?Geometry$/)) {
                 // reset object positioning
                 line.position.set(0, 0, 0);
                 line.rotation.set(0, 0, 0);
@@ -541,6 +551,36 @@ export default Kapsule({
       }
 
       return this;
+    },
+    getGraphBbox: function(state, nodeFilter = () => true) {
+      if (!state.initialised) return null;
+
+      // recursively collect all nested geometries bboxes
+      const bboxes = (function getBboxes(obj) {
+        const bboxes = [];
+
+        if (obj.geometry) {
+          obj.geometry.computeBoundingBox();
+          const box = new three.Box3();
+          box.copy(obj.geometry.boundingBox).applyMatrix4(obj.matrixWorld);
+          bboxes.push(box);
+        }
+        return bboxes.concat(...(obj.children || [])
+          .filter(obj => !obj.hasOwnProperty('__graphObjType') ||
+            (obj.__graphObjType === 'node' && nodeFilter(obj.__data)) // exclude filtered out nodes
+          )
+          .map(getBboxes));
+      })(state.graphScene);
+
+      if (!bboxes.length) return null;
+
+      // extract global x,y,z min/max
+      return Object.assign(...['x', 'y', 'z'].map(c => ({
+        [c]: [
+          d3Min(bboxes, bb => bb.min[c]),
+          d3Max(bboxes, bb => bb.max[c])
+        ]
+      })));
     }
   },
 
@@ -595,8 +635,6 @@ export default Kapsule({
       const sphereGeometries = {}; // indexed by node value
       const sphereMaterials = {}; // indexed by color
 
-      const bypassUpdObjs = new Set(); // keep track of custom objects to bypass update
-
       threeDigest(
         state.graphData.nodes.filter(visibilityAccessor),
         state.graphScene,
@@ -620,9 +658,9 @@ export default Kapsule({
 
             if (customObj && !extendObj) {
               obj = customObj;
-              bypassUpdObjs.add(obj);
             } else { // Add default object (sphere mesh)
               obj = new three.Mesh();
+              obj.__graphDefaultObj = true;
 
               if (customObj && extendObj) {
                 obj.add(customObj); // extend default with custom
@@ -634,12 +672,12 @@ export default Kapsule({
             return obj;
           },
           updateObj: (obj, node) => {
-            if (!bypassUpdObjs.has(obj)) {
+            if (obj.__graphDefaultObj) { // bypass internal updates for custom node objects
               const val = valAccessor(node) || 1;
               const radius = Math.cbrt(val) * state.nodeRelSize;
               const numSegments = state.nodeResolution;
 
-              if (obj.geometry.type !== 'SphereBufferGeometry'
+              if (!obj.geometry.type.match(/^Sphere(Buffer)?Geometry$/)
                 || obj.geometry.parameters.radius !== radius
                 || obj.geometry.parameters.widthSegments !== numSegments
               ) {
@@ -702,11 +740,11 @@ export default Kapsule({
       const colorAccessor = accessorFn(state.linkColor);
       const widthAccessor = accessorFn(state.linkWidth);
 
-      const lineMaterials = {}; // indexed by link color
       const cylinderGeometries = {}; // indexed by link width
+      const lambertLineMaterials = {}; // for cylinder objects, indexed by link color
+      const basicLineMaterials = {}; // for line objects, indexed by link color
 
       const visibleLinks = state.graphData.links.filter(visibilityAccessor);
-      const bypassUpdObjs = new Set(); // keep track of custom objects to bypass update
 
       // lines digest cycle
       threeDigest(
@@ -748,14 +786,16 @@ export default Kapsule({
             let obj;
             if (!customObj) {
               obj = defaultObj;
+              obj.__graphDefaultObj = true;
             } else {
               if (!extendObj) {
                 // use custom object
                 obj = customObj;
-                bypassUpdObjs.add(obj);
               } else {
                 // extend default with custom in a group
                 obj = new three.Group();
+                obj.__graphDefaultObj = true;
+
                 obj.add(defaultObj);
                 obj.add(customObj);
               }
@@ -768,7 +808,7 @@ export default Kapsule({
             return obj;
           },
           updateObj: (updObj, link) => {
-            if (!bypassUpdObjs.has(updObj)) {
+            if (updObj.__graphDefaultObj) { // bypass internal updates for custom link objects
               // select default object if it's an extended group
               const obj = updObj.children.length ? updObj.children[0] : updObj;
 
@@ -780,7 +820,7 @@ export default Kapsule({
                 const r = linkWidth / 2;
                 const numSegments = state.linkResolution;
 
-                if (obj.geometry.type !== 'CylinderBufferGeometry'
+                if (!obj.geometry.type.match(/^Cylinder(Buffer)?Geometry$/)
                   || obj.geometry.parameters.radiusTop !== r
                   || obj.geometry.parameters.radialSegments !== numSegments
                 ) {
@@ -804,12 +844,14 @@ export default Kapsule({
                 const materialColor = new three.Color(colorStr2Hex(color || '#f0f0f0'));
                 const opacity = state.linkOpacity * colorAlpha(color);
 
-                if (obj.material.type !== 'MeshLambertMaterial'
+                const materialType = useCylinder ? 'MeshLambertMaterial' : 'LineBasicMaterial';
+                if (obj.material.type !== materialType
                   || !obj.material.color.equals(materialColor)
                   || obj.material.opacity !== opacity
                 ) {
+                  const lineMaterials = useCylinder ? lambertLineMaterials : basicLineMaterials;
                   if (!lineMaterials.hasOwnProperty(color)) {
-                    lineMaterials[color] = new three.MeshLambertMaterial({
+                    lineMaterials[color] = new three[materialType]({
                       color: materialColor,
                       transparent: opacity < 1,
                       opacity,
@@ -847,7 +889,7 @@ export default Kapsule({
               const arrowLength = arrowLengthAccessor(link);
               const numSegments = state.linkDirectionalArrowResolution;
 
-              if (obj.geometry.type !== 'ConeBufferGeometry'
+              if (!obj.geometry.type.match(/^Cone(Buffer)?Geometry$/)
                 || obj.geometry.parameters.height !== arrowLength
                 || obj.geometry.parameters.radialSegments !== numSegments
               ) {
@@ -963,6 +1005,7 @@ export default Kapsule({
       'numDimensions',
       'forceEngine',
       'dagMode',
+      'dagNodeFilter',
       'dagLevelDistance'
     ])) {
       state.engineRunning = false; // Pause simulation
@@ -996,9 +1039,14 @@ export default Kapsule({
         const getVal = accessorFn(state.nodeVal);
         const nodesPerStack = state.nodesPerStack;
 
-        var nodeDepths = state.dagMode && getDagDepths(state.graphData, node => {
-          return node[state.nodeId];
-        });
+        const nodeDepths = state.dagMode && getDagDepths(
+          state.graphData,
+          node => node[state.nodeId],
+          {
+            nodeFilter: state.dagNodeFilter,
+            onLoopError: state.onDagError || undefined
+          }
+        );
         let depthCounts;
         let depthStackCounts;
         let depthYOffsets;
@@ -1022,7 +1070,7 @@ export default Kapsule({
             }
           });
         }
-
+        
         const maxDepth = Math.max(...Object.values(nodeDepths || []));
         const isDagRadial = state.dagMode && ['radialin', 'radialout'].indexOf(state.dagMode) !== -1;
         const dagLevelDistance = state.dagLevelDistance || state.graphData.nodes.length / (maxDepth || 1) * DAG_LEVEL_NODE_RATIO * (isDagRadial ? 0.7 : 1); 
@@ -1054,7 +1102,7 @@ export default Kapsule({
           const fyFn = getFFn(['td', 'bu'].indexOf(state.dagMode) !== -1, state.dagMode === 'td');
           const fzFn = getFFn(['zin', 'zout'].indexOf(state.dagMode) !== -1, state.dagMode === 'zout');
 
-          state.graphData.nodes.forEach(node => {
+          state.graphData.nodes.filter(state.dagNodeFilter).forEach(node => {
             node.fx = fxFn(node);
             node.fy = fyFn(node);
             node.fz = fzFn(node);
@@ -1065,10 +1113,10 @@ export default Kapsule({
         state.d3ForceLayout.force('dagRadial',
           isDagRadial
             ? d3ForceRadial(node => {
-                const nodeDepth = nodeDepths[node[state.nodeId]];
+                const nodeDepth = nodeDepths[node[state.nodeId]] || -1;
                 return (state.dagMode === 'radialin' ? maxDepth - nodeDepth : nodeDepth) * dagLevelDistance;
               })
-              .strength(1)
+              .strength(node => state.dagNodeFilter(node) ? 1 : 0)
             : null
         );
       } else {
@@ -1076,7 +1124,7 @@ export default Kapsule({
         const graph = ngraph.graph();
         state.graphData.nodes.forEach(node => { graph.addNode(node[state.nodeId]); });
         state.graphData.links.forEach(link => { graph.addLink(link.source, link.target); });
-        layout = ngraph['forcelayout' + (state.numDimensions === 2 ? '' : '3d')](graph);
+        layout = ngraph.forcelayout(graph, { dimensions: state.numDimensions, ...state.ngraphPhysics });
         layout.graph = graph; // Attach graph reference to layout
       }
 

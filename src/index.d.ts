@@ -34,6 +34,7 @@ type ForceEngine = 'd3' | 'ngraph';
 interface ForceFn {
   (alpha: number): void;
   initialize?: (nodes: NodeObject[]) => void;
+  [key: string]: any;
 }
 
 type Coords = { x: number; y: number; z: number; }
@@ -129,6 +130,10 @@ export declare class ThreeForceGraphGeneric<ChainableInstance> extends Object3D 
   dagMode(mode: DagMode): ChainableInstance;
   dagLevelDistance(): number | null;
   dagLevelDistance(distance: number): ChainableInstance;
+  dagNodeFilter(): (node: NodeObject) => boolean;
+  dagNodeFilter(filterFn: (node: NodeObject) => boolean): ChainableInstance;
+  onDagError(): (loopNodeIds: (string | number)[]) => void;
+  onDagError(errorHandleFn: (loopNodeIds: (string | number)[]) => void): ChainableInstance;
   d3AlphaMin(): number;
   d3AlphaMin(alphaMin: number): ChainableInstance;
   d3AlphaDecay(): number;
@@ -140,6 +145,7 @@ export declare class ThreeForceGraphGeneric<ChainableInstance> extends Object3D 
   d3Force(forceName: 'link' | 'charge' | 'center' | string): ForceFn | undefined;
   d3Force(forceName: 'link' | 'charge' | 'center' | string, forceFn: ForceFn): ChainableInstance;
   d3ReheatSimulation(): ChainableInstance;
+  ngraphPhysics(physics: object): ChainableInstance;
   warmupTicks(): number;
   warmupTicks(ticks: number): ChainableInstance;
   cooldownTicks(): number;
@@ -157,6 +163,9 @@ export declare class ThreeForceGraphGeneric<ChainableInstance> extends Object3D 
   tickFrame(): ChainableInstance;
   resetProps(): ChainableInstance;
   refresh(): ChainableInstance;
+
+  // Utilities
+  getGraphBbox(nodeFilter?: (node: NodeObject) => boolean): { x: [number, number], y: [number, number], z: [number,number] };
 }
 
 declare class ThreeForceGraph extends ThreeForceGraphGeneric<ThreeForceGraph> {}
